@@ -1,10 +1,20 @@
+
 import { NextResponse } from "next/server";
 import { createFallbackStudyPlan, type StudyPlan } from "@/lib/study";
+import { estimateTokenCount, truncateMessages, getTokenBudget } from "@/lib/tokenCounter";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const LLM_TIMEOUT_MS = 18_000;
+const LLM_TIMEOUT_MS = 120_000;
+
+// Configuration
+const CONFIG = {
+  MAX_CONTEXT_TOKENS: 8000, // Maximum input context (leave room for output)
+  MAX_OUTPUT_TOKENS: 6000, // Maximum response length
+  MAX_MESSAGES: 8, // Keep only last 8 messages
+  MODEL: process.env.FIREWORKS_MODEL || "accounts/fireworks/models/gpt-oss-120b",
+};
 
 type RequestBody = {
   text?: string;
@@ -16,7 +26,6 @@ export async function POST(request: Request) {
   const text = body.text?.slice(0, 26000) || "";
   const title = body.title || "Study Quest";
   const apiKey = process.env.FIREWORKS_API_KEY;
-  const model = process.env.FIREWORKS_MODEL || "accounts/fireworks/models/gpt-oss-120b";
 
   if (!apiKey) {
     return NextResponse.json({
@@ -25,16 +34,35 @@ export async function POST(request: Request) {
     });
   }
 
-  const planPromise = generateStudyPlan(text, title, apiKey, model);
+  const planPromise = generateStudyPlan(text, title, apiKey);
   return streamJsonResponse(planPromise);
 }
 
-async function generateStudyPlan(text: string, title: string, apiKey: string, model: string) {
+async function generateStudyPlan(text: string, title: string, apiKey: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
 
   console.log("API Key present:", !!apiKey);
-  console.log("Using model:", model);
+  console.log("Using model:", CONFIG.MODEL);
+  console.log("Input text length:", text.length, "characters");
+
+  // Calculate token budget
+  const inputTokens = estimateTokenCount(text);
+  console.log("Estimated input tokens:", inputTokens);
+  
+  // If input is too long, truncate it
+  let truncatedText = text;
+  if (inputTokens > CONFIG.MAX_CONTEXT_TOKENS - 500) {
+    console.log("Text too long, truncating...");
+    // Keep first 4000 tokens worth of text and last 1000 tokens
+    const charsPerToken = 4;
+    const maxChars = (CONFIG.MAX_CONTEXT_TOKENS - 500) * charsPerToken;
+    if (text.length > maxChars) {
+      const firstPart = text.slice(0, Math.floor(maxChars * 0.7));
+      const lastPart = text.slice(-Math.floor(maxChars * 0.3));
+      truncatedText = firstPart + "\n...[content truncated]...\n" + lastPart;
+    }
+  }
 
   try {
     const response = await fetch("https://api.fireworks.ai/inference/v1/chat/completions", {
@@ -45,9 +73,9 @@ async function generateStudyPlan(text: string, title: string, apiKey: string, mo
       },
       signal: controller.signal,
       body: JSON.stringify({
-        model,
+        model: CONFIG.MODEL,
         temperature: 0.18,
-        max_tokens: 3600,
+        max_tokens: CONFIG.MAX_OUTPUT_TOKENS, // Reduced from 8000 to 2000
         response_format: { type: "json_object" },
         messages: [
           {
@@ -56,12 +84,13 @@ async function generateStudyPlan(text: string, title: string, apiKey: string, mo
               "You are a senior exam paper setter, academic tutor, and curriculum designer.",
               "Your MCQs must look like real exam questions, not toy quiz questions.",
               "Every wrong option must be relevant, plausible, and based on a common misconception.",
-              "Return only valid JSON. Do not return markdown."
+              "Return only valid JSON. Do not return markdown.",
+              "Keep responses concise. Focus on quality over quantity."
             ].join(" ")
           },
           {
             role: "user",
-            content: buildExamPrompt(title, text)
+            content: buildExamPrompt(title, truncatedText)
           }
         ]
       })
@@ -69,28 +98,71 @@ async function generateStudyPlan(text: string, title: string, apiKey: string, mo
 
     console.log("Fireworks response status:", response.status);
     console.log("Fireworks response ok:", response.ok);
+    
     if (!response.ok) {
       const errorText = await response.text();
       console.log("Fireworks error response:", errorText);
+      
+      // Check for token limit error
+      if (response.status === 400 && (errorText.includes('context_length') || errorText.includes('token'))) {
+        return {
+          ...createFallbackStudyPlan(text, title),
+          notice: "The input text is too long for the model's context window. Please use a shorter PDF or document.",
+          mode: "fallback" as const
+        };
+      }
+      
       return {
         ...createFallbackStudyPlan(text, title),
-        notice: buildFallbackNotice(response.status, title)
+        notice: buildFallbackNotice(response.status, title),
+        mode: "fallback" as const
       };
     }
 
     const data = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
     };
-    console.log("Fireworks response data:", data);
+    
+    console.log("Token usage:", data.usage);
+    console.log("Fireworks response received successfully");
+    
+    // const content = data.choices?.[0]?.message?.content || "";
+    // const parsed = parsePlan(content);
+
+    // --- ADD THIS DEBUG CODE HERE ---
     const content = data.choices?.[0]?.message?.content || "";
+    console.log("Response length:", content.length);
+    console.log("Response preview (first 200 chars):", content.slice(0, 200));
+    console.log("Response preview (last 200 chars):", content.slice(-200));
+    // --- END DEBUG CODE ---
+
     const parsed = parsePlan(content);
 
+    if (!parsed) {
+      console.log("Failed to parse LLM response, using fallback");
+      return {
+        ...createFallbackStudyPlan(text, title),
+        notice: "The LLM response could not be parsed. This is a basic fallback.",
+        mode: "fallback" as const
+      };
+    }
+
     return normalizePlan(parsed, text, title);
+    
   } catch (error) {
     console.log("Error in generateStudyPlan:", error);
+    if (error instanceof Error && error.name === 'AbortError') {
+      return {
+        ...createFallbackStudyPlan(text, title),
+        notice: "The LLM request timed out. Please try again with a shorter document.",
+        mode: "fallback" as const
+      };
+    }
     return {
       ...createFallbackStudyPlan(text, title),
-      notice: "The LLM request timed out or could not reach Fireworks. Check network access, model access, and the API key."
+      notice: "The LLM request could not reach Fireworks. Check network access, model access, and the API key.",
+      mode: "fallback" as const
     };
   } finally {
     clearTimeout(timeout);
@@ -150,6 +222,8 @@ First, understand the PDF. Remove noise such as headers, footers, page numbers, 
 
 Then create a learning plan that teaches the material and tests it like a real exam.
 
+IMPORTANT: Keep the response concise. Focus on quality over quantity.
+
 Return this exact JSON shape:
 {
   "title": "short academic title",
@@ -160,8 +234,8 @@ Return this exact JSON shape:
       "title": "specific concept title",
       "subtitle": "specific learning objective",
       "theme": "short visual theme",
-      "plainSummary": "4-6 easy sentences. Keep only important teachable content from this part.",
-      "teachingScript": "160-230 words. Mature, simple explanation. Explain definitions, relationships, cause/effect, and one example if useful. No childish fantasy story.",
+      "plainSummary": "3-4 easy sentences. Keep only important teachable content from this part.",
+      "teachingScript": "120-180 words. Mature, simple explanation. Explain definitions, relationships, cause/effect, and one example if useful. No childish fantasy story.",
       "imagePrompt": "educational illustration prompt for this concept, no text, no labels, no watermark",
       "difficulty": "Spark",
       "story": "same as teachingScript",
@@ -180,16 +254,16 @@ Return this exact JSON shape:
 }
 
 Strict section rules:
-- Divide the PDF into 4 to 7 logical concepts in learning order.
+- Divide the PDF into 4 to 6 logical concepts in learning order.
 - Do not make a level from tiny fragments, headings, citations, or formatting.
 - Each part must focus on one meaningful concept.
 - Use easy language, but keep the science/math/academic meaning correct.
 
 Strict MCQ rules:
-- Each part must have exactly 5 MCQs.
+- Each part must have exactly 4 MCQs (reduced from 5 to save tokens).
 - Each MCQ must have exactly 4 options.
 - Questions must look like real exam questions.
-- Questions must test: definition, relationship, cause/effect, application, and misconception.
+- Questions must test: definition, relationship, cause/effect, and application.
 - Do not ask useless questions like "what is the main idea", "which sentence matches", page numbers, headings, filenames, or PDF formatting.
 - Every option must be related to the same topic and similar in style/length.
 - Exactly one option must be correct.
@@ -212,21 +286,108 @@ PDF text:
 ${text}`;
 }
 
+
+
+// added new function
+// Add this function to your route.ts file
+function repairIncompleteJson(content: string): any | null {
+  try {
+    // Try to find the JSON structure
+    const jsonStart = content.indexOf("{");
+    if (jsonStart < 0) return null;
+    
+    let jsonStr = content.slice(jsonStart);
+    
+    // Count brackets to see if incomplete
+    let openBraces = 0;
+    let closeBraces = 0;
+    let openBrackets = 0;
+    let closeBrackets = 0;
+    
+    for (const char of jsonStr) {
+      if (char === '{') openBraces++;
+      if (char === '}') closeBraces++;
+      if (char === '[') openBrackets++;
+      if (char === ']') closeBrackets++;
+    }
+    
+    // If incomplete, try to close it
+    if (openBraces > closeBraces || openBrackets > closeBrackets) {
+      console.log("JSON appears incomplete, attempting repair...");
+      
+      // Try to extract what we have
+      const lastValidBrace = jsonStr.lastIndexOf('}');
+      if (lastValidBrace > 0) {
+        jsonStr = jsonStr.slice(0, lastValidBrace + 1);
+      }
+      
+      // Try to parse after repair
+      try {
+        return JSON.parse(jsonStr);
+      } catch (e) {
+        console.log("Could not repair JSON");
+        return null;
+      }
+    }
+    
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    return null;
+  }
+}
+
+// function parsePlan(content: string): StudyPlan | null {
+//   try {
+//     const jsonStart = content.indexOf("{");
+//     const jsonEnd = content.lastIndexOf("}");
+//     if (jsonStart < 0 || jsonEnd < 0) {
+//       return null;
+//     }
+
+//     const parsed = JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as StudyPlan;
+//     if (!parsed.parts?.length) {
+//       return null;
+//     }
+
+//     return parsed;
+//   } catch {
+//     return null;
+//   }
+// }
+
 function parsePlan(content: string): StudyPlan | null {
   try {
     const jsonStart = content.indexOf("{");
     const jsonEnd = content.lastIndexOf("}");
+    
     if (jsonStart < 0 || jsonEnd < 0) {
+      console.log("No JSON found in response");
+      // Log the first 500 chars for debugging
+      console.log("Response preview:", content.slice(0, 500));
       return null;
     }
 
-    const parsed = JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as StudyPlan;
-    if (!parsed.parts?.length) {
-      return null;
+    // Try normal parse first
+    try {
+      const parsed = JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as StudyPlan;
+      if (parsed.parts?.length) return parsed;
+    } catch (e) {
+      console.log("Normal parse failed, trying repair...");
     }
 
-    return parsed;
-  } catch {
+    // Try repair
+    const repaired = repairIncompleteJson(content);
+    if (repaired?.parts?.length) {
+      console.log("Successfully repaired JSON");
+      return repaired as StudyPlan;
+    }
+
+    console.log("Could not parse response");
+    console.log("Response preview:", content.slice(0, 500));
+    return null;
+    
+  } catch (error) {
+    console.log("Parse error:", error);
     return null;
   }
 }
@@ -237,7 +398,7 @@ function normalizePlan(plan: StudyPlan | null, text: string, title: string): Stu
   }
 
   const fallback = createFallbackStudyPlan(text, title);
-  const parts = plan.parts.slice(0, 7).map((part, index) => {
+  const parts = plan.parts.slice(0, 6).map((part, index) => {
     const fallbackPart = fallback.parts[index] || fallback.parts[0];
     const teachingScript = part.teachingScript || part.story || fallbackPart.teachingScript;
     const plainSummary = part.plainSummary || fallbackPart.plainSummary;
@@ -245,7 +406,7 @@ function normalizePlan(plan: StudyPlan | null, text: string, title: string): Stu
     const validMcqs = Array.isArray(part.mcqs)
       ? part.mcqs.map(normalizeMcq).filter((mcq): mcq is NonNullable<ReturnType<typeof normalizeMcq>> => Boolean(mcq))
       : [];
-    const mcqs = validMcqs.length >= 3 ? validMcqs.slice(0, 5) : fallbackPart.mcqs;
+    const mcqs = validMcqs.length >= 3 ? validMcqs.slice(0, 4) : fallbackPart.mcqs;
 
     return {
       ...fallbackPart,
